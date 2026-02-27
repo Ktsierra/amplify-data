@@ -66,6 +66,8 @@ type InternalSchemaModels = Record<
   InternalModel | EnumType | CustomType<any> | InternalCustom
 >;
 
+export type SelectionSetDepthValue = 1 | 2 | 3 | 4 | 5;
+
 export type ModelSchemaParamShape = {
   types: ModelSchemaContents;
   authorization: SchemaAuthorization<any, any, any>[];
@@ -73,6 +75,8 @@ export type ModelSchemaParamShape = {
 };
 
 export type RDSModelSchemaParamShape = ModelSchemaParamShape;
+
+export const DEFAULT_SELECTION_SET_DEPTH: SelectionSetDepthValue = 5;
 
 export type InternalSchema = {
   data: {
@@ -109,22 +113,40 @@ export type GenericModelSchema<T extends ModelSchemaParamShape> =
  *
  * @param T - The shape of the model schema
  * @param UsedMethods - The method keys already defined
+ * @param Depth - Selection set depth; carried as a separate generic param (rather than
+ *   inside T via SetTypeSubArg) to avoid nested mapped-type overhead that breaks
+ *   eslint's type resolver on large schemas
  */
 export type ModelSchema<
   T extends ModelSchemaParamShape,
-  UsedMethods extends 'authorization' | 'relationships' = never,
+  UsedMethods extends 'authorization' | 'relationships' | 'selectionSetDepth' = never,
+  Depth extends SelectionSetDepthValue = 5,
 > = Omit<
   {
     authorization: <AuthRules extends SchemaAuthorization<any, any, any>>(
       callback: (allow: AllowModifier) => AuthRules | AuthRules[],
     ) => ModelSchema<
       SetTypeSubArg<T, 'authorization', AuthRules[]>,
-      UsedMethods | 'authorization'
+      UsedMethods | 'authorization',
+      Depth
     >;
+    /**
+     * Controls how many relationship hops are inlined in the flatModel used
+     * for custom selection set type generation. `selectionSetDepth(N)` allows
+     * selection set paths up to N relationship edges deep.
+     *
+     * @param depth - 1–5 (default 5). Lower values reduce TS instantiations
+     * and prevent TS2590 on dense bidirectional schemas, at the cost of
+     * shallower nested selection set types.
+     */
+    selectionSetDepth: <D extends SelectionSetDepthValue>(
+      depth: D,
+    ) => ModelSchema<T, UsedMethods | 'selectionSetDepth', D>;
   },
   UsedMethods
 > &
   BaseSchema<T> &
+  { data: { selectionSetDepth: Depth } } &
   DDBSchemaBrand;
 
 type RDSModelSchemaFunctions =
@@ -133,6 +155,7 @@ type RDSModelSchemaFunctions =
   | 'addMutations'
   | 'addSubscriptions'
   | 'authorization'
+  | 'selectionSetDepth'
   | 'setRelationships'
   | 'setAuthorization'
   | 'renameModelFields'
@@ -152,17 +175,20 @@ type RelationshipTemplate = Record<
  *
  * @param T - The shape of the RDS model schema
  * @param UsedMethods - The method keys already defined
+ * @param Depth - Selection set depth (see {@link ModelSchema} for details)
  */
 export type RDSModelSchema<
   T extends RDSModelSchemaParamShape,
   UsedMethods extends RDSModelSchemaFunctions = never,
+  Depth extends SelectionSetDepthValue = 5,
 > = Omit<
   {
     addToSchema: <AddedTypes extends AddToSchemaContents>(
       types: AddedTypes,
     ) => RDSModelSchema<
       SetTypeSubArg<T, 'types', T['types'] & AddedTypes>,
-      UsedMethods | 'addToSchema'
+      UsedMethods | 'addToSchema',
+      Depth
     >;
     /**
      * @deprecated use `addToSchema()` to add operations to a SQL schema
@@ -171,7 +197,8 @@ export type RDSModelSchema<
       types: Queries,
     ) => RDSModelSchema<
       SetTypeSubArg<T, 'types', T['types'] & Queries>,
-      UsedMethods | 'addQueries'
+      UsedMethods | 'addQueries',
+      Depth
     >;
     /**
      * @deprecated use `addToSchema()` to add operations to a SQL schema
@@ -180,7 +207,8 @@ export type RDSModelSchema<
       types: Mutations,
     ) => RDSModelSchema<
       SetTypeSubArg<T, 'types', T['types'] & Mutations>,
-      UsedMethods | 'addMutations'
+      UsedMethods | 'addMutations',
+      Depth
     >;
     /**
      * @deprecated use `addToSchema()` to add operations to a SQL schema
@@ -191,21 +219,35 @@ export type RDSModelSchema<
       types: Subscriptions,
     ) => RDSModelSchema<
       SetTypeSubArg<T, 'types', T['types'] & Subscriptions>,
-      UsedMethods | 'addSubscriptions'
+      UsedMethods | 'addSubscriptions',
+      Depth
     >;
     // TODO: hide this, since SQL schema auth is configured via .setAuthorization?
     authorization: <AuthRules extends SchemaAuthorization<any, any, any>>(
       callback: (allow: AllowModifier) => AuthRules | AuthRules[],
     ) => RDSModelSchema<
       SetTypeSubArg<T, 'authorization', AuthRules[]>,
-      UsedMethods | 'authorization'
+      UsedMethods | 'authorization',
+      Depth
     >;
+    /**
+     * Controls how many relationship hops are inlined in the flatModel used
+     * for custom selection set type generation. `selectionSetDepth(N)` allows
+     * selection set paths up to N relationship edges deep.
+     *
+     * @param depth - 1–5 (default 5). Lower values reduce TS instantiations
+     * and prevent TS2590 on dense bidirectional schemas, at the cost of
+     * shallower nested selection set types.
+     */
+    selectionSetDepth: <D extends SelectionSetDepthValue>(
+      depth: D,
+    ) => RDSModelSchema<T, UsedMethods | 'selectionSetDepth', D>;
     setAuthorization: (
       callback: (
         models: OmitFromEach<BaseSchema<T, true>['models'], 'secondaryIndexes'>,
-        schema: RDSModelSchema<T, UsedMethods | 'setAuthorization'>,
+        schema: RDSModelSchema<T, UsedMethods | 'setAuthorization', Depth>,
       ) => void,
-    ) => RDSModelSchema<T>;
+    ) => RDSModelSchema<T, never, Depth>;
     setRelationships: <
       Relationships extends ReadonlyArray<
         Partial<Record<keyof T['types'], RelationshipTemplate>>
@@ -229,7 +271,8 @@ export type RDSModelSchema<
           >;
         }
       >,
-      UsedMethods | 'setRelationships'
+      UsedMethods | 'setRelationships',
+      Depth
     >;
     renameModels: <
       NewName extends string,
@@ -239,12 +282,14 @@ export type RDSModelSchema<
       callback: () => ChangeLog,
     ) => RDSModelSchema<
       SetTypeSubArg<T, 'types', RenameUsingTuples<T['types'], ChangeLog>>,
-      UsedMethods | 'renameModels'
+      UsedMethods | 'renameModels',
+      Depth
     >;
   },
   UsedMethods
 > &
   BaseSchema<T, true> &
+  { data: { selectionSetDepth: Depth } } &
   RDSSchemaBrand;
 
 /**
@@ -326,10 +371,13 @@ function _rdsSchema<
   T extends RDSModelSchemaParamShape,
   DSC extends SchemaConfiguration<any, any>,
 >(types: T['types'], config: DSC): RDSModelSchema<T> {
-  const data: RDSModelSchemaParamShape = {
+  const data: RDSModelSchemaParamShape & {
+    selectionSetDepth: SelectionSetDepthValue;
+  } = {
     types,
     authorization: [],
     configuration: config,
+    selectionSetDepth: DEFAULT_SELECTION_SET_DEPTH,
   };
   const models = filterSchemaModelTypes(data.types) as any;
   return {
@@ -347,6 +395,12 @@ function _rdsSchema<
       const rules = callback(allow);
       this.data.authorization = Array.isArray(rules) ? rules : [rules];
       const { authorization: _, ...rest } = this;
+      return rest;
+    },
+    // Value is only consumed via Metadata['selectionSetDepth'] during type resolution, not read at runtime.
+    selectionSetDepth(depth): any {
+      (this.data as any).selectionSetDepth = depth;
+      const { selectionSetDepth: _, ...rest } = this;
       return rest;
     },
     addToSchema(types: AddToSchemaContents): any {
@@ -422,10 +476,11 @@ function _ddbSchema<
   T extends ModelSchemaParamShape,
   DSC extends SchemaConfiguration<any, any>,
 >(types: T['types'], config: DSC): ModelSchema<T> {
-  const data: ModelSchemaParamShape = {
+  const data: ModelSchemaParamShape & { selectionSetDepth: 5 } = {
     types,
     authorization: [],
     configuration: config,
+    selectionSetDepth: 5 as const,
   };
   return {
     data,
@@ -441,6 +496,12 @@ function _ddbSchema<
       const rules = callback(allow);
       this.data.authorization = Array.isArray(rules) ? rules : [rules];
       const { authorization: _, ...rest } = this;
+      return rest;
+    },
+    // Value is only consumed via Metadata['selectionSetDepth'] during type resolution, not read at runtime.
+    selectionSetDepth(depth): any {
+      (this.data as any).selectionSetDepth = depth;
+      const { selectionSetDepth: _, ...rest } = this;
       return rest;
     },
     models: filterSchemaModelTypes(data.types),

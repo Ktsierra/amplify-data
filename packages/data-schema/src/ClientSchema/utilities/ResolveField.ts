@@ -12,6 +12,12 @@ import type { ModelTypeParamShape } from '../../ModelType';
 
 type ExtendsNever<T> = [T] extends [never] ? true : false;
 
+// The default selection set depth (5) is repeated as a generic default across
+// FlatResolveFields, ResolveIndividualField, ResolveRelationship, and FlattenRelationships.
+// TypeScript doesn't support type-level constants as generic defaults, so if the
+// default ever changes, all occurrences here (and in ExtractSelectionSetDepth)
+// must be updated to match.
+
 /**
  * Takes a `ReturnType<typeof a.model()>` and turns it into a client-consumable type. Fields
  * definitions (e.g., `a.string()`) are turned into the client facing types (e.g., `string`),
@@ -37,8 +43,9 @@ export type FlatResolveFields<
   Bag extends Record<string, any>,
   T,
   FlatModelName extends keyof Bag & string = never,
+  Depth extends number = 5,
 > = ShallowPretty<{
-  [K in keyof T]: ResolveIndividualField<Bag, T[K], FlatModelName>;
+  [K in keyof T]: ResolveIndividualField<Bag, T[K], FlatModelName, Depth>;
 }>;
 
 // TODO: Remove ShallowPretty from this layer of resolution. Re-incorporate prettification
@@ -53,13 +60,14 @@ export type ResolveIndividualField<
   Bag extends Record<string, any>,
   T,
   FlatModelName extends keyof Bag & string = never,
+  Depth extends number = 5,
 > =
   T extends BaseModelField<infer FieldShape>
     ? FieldShape
     : T extends RefType<infer RefShape, any, any>
       ? ResolveRef<RefShape, Bag>
       : T extends ModelRelationshipField<infer RelationshipShape, any, any, any>
-        ? ResolveRelationship<Bag, RelationshipShape, FlatModelName>
+        ? ResolveRelationship<Bag, RelationshipShape, FlatModelName, Depth>
         : T extends CustomType<infer CT>
           ? ResolveFields<Bag, CT['fields']> | null
           : T extends EnumType<infer values>
@@ -112,33 +120,69 @@ type ShortCircuitBiDirectionalRelationship<
     : Field]: Model[Field];
 };
 
+/** Subtract 1 from a depth counter (bounded to the 1–5 range). Falls through to 0 for any value outside the range. */
+type Decrement<N extends number> =
+  N extends 5 ? 4 : N extends 4 ? 3 : N extends 3 ? 2 : N extends 2 ? 1 : N extends 1 ? 0 : 0;
+
 /**
- * Takes a resolved model type (which has LazyLoader relationship fields) and replaces
- * each relationship field with the related model's resolved `type` inlined as a plain object.
- * This is non-recursive because the inlined `type` contains LazyLoaders (functions),
- * which ModelPathInner won't recurse into, breaking the cascade.
+ * Replaces each relationship field in a resolved model type with the related model's
+ * resolved `type` inlined as a plain object (or array of objects).
+ *
+ * At Depth=0, strips relationship fields entirely — they can't be traversed further,
+ * and keeping them as LazyLoaders would force TypeScript to instantiate every
+ * transitive LazyLoader generic, adding significant overhead on dense schemas.
  */
 type FlattenRelationships<
   Bag extends Record<string, any>,
   Model extends Record<string, any>,
   RawFields extends Record<string, any>,
+  Depth extends number = 5,
+> = Depth extends 0
+  ? OmitRelationships<Model, RawFields>
+  : {
+      [K in keyof Model]: K extends keyof RawFields
+        ? RawFields[K] extends ModelRelationshipField<infer RS, any, any, any>
+          ? RS['array'] extends true
+            ? Array<
+                FlattenRelationships<
+                  Bag,
+                  Bag[RS['relatedModel']]['type'],
+                  Bag[RS['relatedModel']]['__meta']['rawType']['fields'],
+                  Decrement<Depth>
+                >
+              >
+            : FlattenRelationships<
+                Bag,
+                Bag[RS['relatedModel']]['type'],
+                Bag[RS['relatedModel']]['__meta']['rawType']['fields'],
+                Decrement<Depth>
+              >
+          : Model[K]
+        : Model[K];
+    };
+
+/** At the depth boundary, strip relationship fields — they can't be traversed further. */
+type OmitRelationships<
+  Model extends Record<string, any>,
+  RawFields extends Record<string, any>,
 > = {
-  [K in keyof Model]: K extends keyof RawFields
-    ? RawFields[K] extends ModelRelationshipField<infer RS, any, any, any>
-      ? RS['array'] extends true
-        ? Array<Bag[RS['relatedModel']]['type']>
-        : Bag[RS['relatedModel']]['type']
-      : Model[K]
-    : Model[K];
+  [K in keyof Model as K extends keyof RawFields
+    ? RawFields[K] extends ModelRelationshipField<any, any, any, any>
+      ? never
+      : K
+    : K]: Model[K];
 };
 
 type ResolveRelationship<
   Bag extends Record<string, any>,
   RelationshipShape extends ModelRelationshipFieldParamShape,
   ParentModelName extends keyof Bag & string = never,
+  Depth extends number = 5,
 > =
   ExtendsNever<ParentModelName> extends true
-    ? DependentLazyLoaderOpIsAvailable<Bag, RelationshipShape> extends true
+    ? // Non-flat (normal `type`) branch: Depth is not needed here because LazyLoader
+      // fields are functions that won't be recursed into by ModelPathInner.
+      DependentLazyLoaderOpIsAvailable<Bag, RelationshipShape> extends true
       ? LazyLoader<
           RelationshipShape['valueRequired'] extends true
             ? Bag[RelationshipShape['relatedModel']]['type']
@@ -146,14 +190,23 @@ type ResolveRelationship<
           RelationshipShape['array']
         >
       : never
-    : // Array-ing inline here vs. (inside of ShortCircuitBiDirectionalRelationship or in a separate conditional type) is significantly more performant
+    : // Flat model branch: inline relationships up to Depth, then stop.
+      // Note: ShortCircuitBiDirectionalRelationship only strips belongsTo fields pointing
+      // back to the *immediate* parent, not the full ancestor chain. For triangle patterns
+      // (A ↔ B ↔ C ↔ A), non-immediate back-references are still inlined. The Depth limit
+      // is the safety valve that prevents TS2590 in these cases.
+      // Array-ing inline here vs. (inside of ShortCircuitBiDirectionalRelationship or in a separate conditional type) is significantly more performant
+      //
+      // Decrement here so the first relationship hop from the parent model consumes one
+      // level, making selectionSetDepth(N) give exactly N traversable hops.
       RelationshipShape['array'] extends true
       ? Array<
           ShortCircuitBiDirectionalRelationship<
             FlattenRelationships<
               Bag,
               Bag[RelationshipShape['relatedModel']]['type'],
-              Bag[RelationshipShape['relatedModel']]['__meta']['rawType']['fields']
+              Bag[RelationshipShape['relatedModel']]['__meta']['rawType']['fields'],
+              Decrement<Depth>
             >,
             ParentModelName,
             Bag[RelationshipShape['relatedModel']]['__meta']['rawType']['fields']
@@ -163,7 +216,8 @@ type ResolveRelationship<
           FlattenRelationships<
             Bag,
             Bag[RelationshipShape['relatedModel']]['type'],
-            Bag[RelationshipShape['relatedModel']]['__meta']['rawType']['fields']
+            Bag[RelationshipShape['relatedModel']]['__meta']['rawType']['fields'],
+            Decrement<Depth>
           >,
           ParentModelName,
           Bag[RelationshipShape['relatedModel']]['__meta']['rawType']['fields']

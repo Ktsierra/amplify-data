@@ -106,7 +106,7 @@ type FlatClientFields<
   IsRDS extends boolean,
   T extends ModelTypeParamShape,
   ModelName extends keyof Bag & string,
-> = FlatResolveFields<Bag, T['fields'], ModelName> &
+> = FlatResolveFields<Bag, T['fields'], ModelName, Metadata['selectionSetDepth']> &
   If<Not<IsRDS>, ImplicitIdentifier<T>> &
   AuthFields<Metadata, T> &
   Omit<SystemFields<IsRDS>, keyof ResolveFields<Bag, T['fields']>>;
